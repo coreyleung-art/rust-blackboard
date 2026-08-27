@@ -6,3 +6,6 @@
 
 ## v0.6.0 (2026-08-25)
 - Rust 版黑板（Python 版无缝替换）：KV + 订阅 + 全局 seq HLC 时间轴 + audit 持久化 + SSE 事件桥（原 8803 并入）
+
+## v0.6.2 (2026-08-28)
+- **修复**: audit 保留策略补全——.jsonl 与 .jsonl.gz 统一纳入 ARCHIVE_KEEP（此前 .gz 旧档不清理会累积）

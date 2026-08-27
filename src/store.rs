@@ -375,11 +375,11 @@ impl Store {
         let arch = PathBuf::from(&self.data_dir).join(format!("audit-{}.jsonl", &ts[..14]));
         let _ = fs::rename(&ap, &arch);
         // 压缩（简单：直接保留 .jsonl；Python 版 gzip——为兼容保留未压缩即可，读取端用 jsonl 也行）
-        // 清理超龄
+        // 清理超龄（2026-08-28 补全：.jsonl 与 .gz 统一纳入保留策略，各保留 ARCHIVE_KEEP 份）
         let mut audits: Vec<String> = fs::read_dir(&self.data_dir)
             .map(|rd| rd.flatten().filter_map(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("audit-") && n.ends_with(".jsonl") { Some(n) } else { None }
+                if n.starts_with("audit-") && (n.ends_with(".jsonl") || n.ends_with(".jsonl.gz")) { Some(n) } else { None }
             }).collect())
             .unwrap_or_default();
         audits.sort();
