@@ -9,3 +9,7 @@
 
 ## v0.6.2 (2026-08-28)
 - **修复**: audit 保留策略补全——.jsonl 与 .jsonl.gz 统一纳入 ARCHIVE_KEEP（此前 .gz 旧档不清理会累积）
+
+## v0.6.3 (2026-08-28)
+- **新增**: POST /register 设备注册 API（P1-3a）——生成 device-id + token，存 nodes/<name>/identity
+- **新增**: simple_hash（确定性哈希，device-id/token 生成）

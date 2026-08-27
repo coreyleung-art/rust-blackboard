@@ -200,19 +200,42 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
         }
         "POST" => {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-            if path.trim_end_matches('/').ends_with("subscribe") {
+            let path_clean = path.trim_end_matches('/').to_string();
+            if path_clean == "register" {
+                // P1-3a 设备注册：生成 device-id + token，存 nodes/<device>/identity
+                let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("device").to_string();
+                let ts = crate::store::now_ts_public();
+                let seed = format!("{}:{}:{}", name, ts, std::process::id());
+                let device_id = format!("dev-{}", simple_hash(&seed));
+                let token = format!("tk-{}", simple_hash(&format!("{}:{}", device_id, seed)));
+                let identity = json!({
+                    "device_id": device_id,
+                    "name": name,
+                    "token": token,
+                    "registered": ts,
+                    "status": "active"
+                });
+                let (ver, _seq) = store.put(&format!("nodes/{}/identity", name), identity.clone(), Some("register"));
+                crate::sse::broadcast(&format!("nodes/{}/identity", name), Some(&identity), ver);
+                (200, json!({
+                    "device_id": device_id,
+                    "token": token,
+                    "name": name,
+                    "registered": ts
+                }))
+            } else if path_clean.ends_with("subscribe") {
                 let topic = body.get("topic").and_then(|t| t.as_str()).unwrap_or("");
                 let cb = body.get("callback").and_then(|c| c.as_str()).unwrap_or("");
                 let unsub = body.get("unsub").and_then(|u| u.as_bool()).unwrap_or(false);
                 let n = store.subscribe(topic, cb, unsub);
                 if unsub {
-                    let removed = 1; // Python 版返回 removed 计数（简化：按匹配数）
+                    let removed = 1;
                     (200, json!({"unsubscribed": removed, "subscribed": n}))
                 } else {
                     (200, json!({"subscribed": n}))
                 }
             } else {
-                (400, json!({"error": "use /subscribe"}))
+                (400, json!({"error": "use /subscribe or /register"}))
             }
         }
         _ => (405, json!({"error": "method not allowed"})),
@@ -246,6 +269,16 @@ fn ns_match(path: &str) -> Option<String> {
     if !ns.chars().all(|c| c.is_ascii_lowercase()) { return None; }
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) { return None; }
     Some(format!("{}/{}", ns, key))
+}
+
+/// 简单确定性哈希（device-id/token 生成，非密码学用途；签名防伪走 Ed25519）
+fn simple_hash(s: &str) -> String {
+    let mut h: u64 = 1469598103934665603;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{:016x}", h)
 }
 
 fn handle_get(store: &Arc<Store>, path: &str, query: &[(String, String)]) -> (u16, Value) {
