@@ -1,0 +1,4 @@
+target/
+*.log
+# 运行中的旧名文件（launchd 指向，进程锁定中）——版本化以 0.6.1 为准
+dist/rust-blackboard-macos-arm64-v0.6.0

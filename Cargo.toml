@@ -1,0 +1,18 @@
+[package]
+name = "rust-blackboard"
+version = "0.6.1"
+edition = "2021"
+description = "黑板 blackboard-server v0.6 Rust 版（:8792，协议/API/存储格式与 Python 版一字兼容）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+chrono = { version = "0.4.45", features = ["clock"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
