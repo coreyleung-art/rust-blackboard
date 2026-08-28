@@ -29,23 +29,33 @@ pub fn serve(store: Arc<Store>) {
 }
 
 // ── SSE 事件桥（原 8803）：GET /events 长连接 + POST /cb 回调入口 ──
-pub fn serve_sse(_store: Arc<Store>, port: u16) {
+pub fn serve_sse(store: Arc<Store>, port: u16) {
     let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)) {
         Ok(l) => l,
         Err(e) => { eprintln!("sse bind :{} failed: {}", port, e); return; }
     };
     for stream in listener.incoming() {
         if let Ok(s) = stream {
+            let st = store.clone();
             std::thread::spawn(move || {
-                let _ = handle_sse_conn(s);
+                let _ = handle_sse_conn(st, s);
             });
         }
     }
 }
 
-fn handle_sse_conn(mut stream: TcpStream) -> Result<(), String> {
+fn handle_sse_conn(store: Arc<Store>, mut stream: TcpStream) -> Result<(), String> {
     let req = match parse_request(&mut stream) { Some(r) => r, None => return Ok(()) };
     let path = req.path.trim_end_matches('/').to_string();
+    // P1-3c: SSE 端点认证（token 启用时校验；/events 非公开白名单）
+    {
+        let token_hdr = header(&req.headers, "x-blackboard-token")
+            .or_else(|| header(&req.headers, "authorization"));
+        if !store.authorized(token_hdr) {
+            respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+            return Ok(());
+        }
+    }
     match req.method.as_str() {
         "POST" => {
             // 黑板回调入口（原 /cb）：body {key, value, version} → SSE 广播
@@ -168,10 +178,14 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
         Some(r) => r,
         None => return Ok(()),
     };
-    // 认证
-    let token_hdr = header(&req.headers, "x-blackboard-token");
-    if !store.authorized(token_hdr) {
-        return respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+    // 认证（P1-3c：白名单端点免认证，其余校验 token）
+    let raw_path = req.path.trim_start_matches('/').to_string();
+    if !store.is_public_path(&raw_path) {
+        let token_hdr = header(&req.headers, "x-blackboard-token")
+            .or_else(|| header(&req.headers, "authorization"));
+        if !store.authorized(token_hdr) {
+            return respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+        }
     }
     let writer = header(&req.headers, "x-writer").map(|s| s.to_string());
     let path = req.path.trim_start_matches('/').to_string();

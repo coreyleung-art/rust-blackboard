@@ -483,9 +483,21 @@ impl Store {
     }
 
     // 认证
+    /// P1-3c 认证中间件：token 空=不校验；支持 X-Blackboard-Token 或 Bearer
     pub fn authorized(&self, header_token: Option<&str>) -> bool {
         if self.token.is_empty() { return true; }
-        header_token == Some(self.token.as_str())
+        match header_token {
+            Some(t) => {
+                // 支持 X-Blackboard-Token: <token> 或 Authorization: Bearer <token>
+                let clean = t.strip_prefix("Bearer ").unwrap_or(t).trim();
+                clean == self.token.as_str()
+            }
+            None => false,
+        }
+    }
+    /// 公开端点白名单（健康检查/对时免认证）
+    pub fn is_public_path(&self, path: &str) -> bool {
+        matches!(path, "clock" | "help" | "ns-registry")
     }
 }
 

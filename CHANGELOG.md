@@ -13,3 +13,6 @@
 ## v0.6.3 (2026-08-28)
 - **新增**: POST /register 设备注册 API（P1-3a）——生成 device-id + token，存 nodes/<name>/identity
 - **新增**: simple_hash（确定性哈希，device-id/token 生成）
+
+## v0.6.4 (2026-08-28)
+- **新增**: P1-3c 认证中间件——Bearer token 支持 + 公开端点白名单（clock/help/ns-registry）+ SSE 端点补校验（安全缺口修复）
