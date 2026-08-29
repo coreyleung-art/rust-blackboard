@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "rust-blackboard"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "encoding_rs",

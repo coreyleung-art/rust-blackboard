@@ -496,8 +496,15 @@ impl Store {
         }
     }
     /// 公开端点白名单（健康检查/对时免认证）
+    /// v0.6.5: 加 i9 节点豁免——i9 node-bridge 暂缓升级（无 token 能力），
+    /// 其请求路径（nodes/i9/* / tasks?node=i9 / notes/i9/*）放行，避免启用 token 后 i9 断链
     pub fn is_public_path(&self, path: &str) -> bool {
         matches!(path, "clock" | "help" | "ns-registry")
+            || path.contains("nodes/i9/")
+            || path.contains("notes/i9/")
+            || path.contains("tasks?node=i9")
+            || path.contains("tasks/node=i9")
+            || path == "tasks?node=i9"
     }
 }
 

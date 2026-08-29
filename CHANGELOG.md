@@ -1,3 +1,7 @@
+## v0.6.5 (2026-08-29)
+- **新增**: i9 节点认证豁免——i9 node-bridge 暂缓升级（无 token），其路径（nodes/i9/*、notes/i9/*、tasks?node=i9）免认证，避免启用 token 后 i9 断链
+- **新增**: SSE /events 读端公开豁免（只读事件流，含 i9 订阅；写端才需 token）
+- **修复**: 认证判定用完整 path?query（tasks?node=i9 豁免需 query）
 # rust-blackboard CHANGELOG
 
 ## v0.6.1 (2026-08-28)

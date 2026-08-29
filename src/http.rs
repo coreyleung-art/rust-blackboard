@@ -48,10 +48,12 @@ fn handle_sse_conn(store: Arc<Store>, mut stream: TcpStream) -> Result<(), Strin
     let req = match parse_request(&mut stream) { Some(r) => r, None => return Ok(()) };
     let path = req.path.trim_end_matches('/').to_string();
     // P1-3c: SSE 端点认证（token 启用时校验；/events 非公开白名单）
+    // v0.6.5: /events 豁免认证——SSE 是只读事件流（含 i9 订阅，其 central-inbox 无 token），写端才需 token
+    let sse_public = path.ends_with("/events") || path == "events";
     {
         let token_hdr = header(&req.headers, "x-blackboard-token")
             .or_else(|| header(&req.headers, "authorization"));
-        if !store.authorized(token_hdr) {
+        if !sse_public && !store.authorized(token_hdr) {
             respond(&mut stream, 401, &json!({"error": "unauthorized"}));
             return Ok(());
         }
@@ -180,7 +182,13 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
     };
     // 认证（P1-3c：白名单端点免认证，其余校验 token）
     let raw_path = req.path.trim_start_matches('/').to_string();
-    if !store.is_public_path(&raw_path) {
+    // v0.6.5: 认证判定用完整 path?query（tasks?node=i9 豁免需要 query）
+    let full_path = if req.query.is_empty() {
+        raw_path.clone()
+    } else {
+        format!("{}?{}", raw_path, req.query.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&"))
+    };
+    if !store.is_public_path(&full_path) {
         let token_hdr = header(&req.headers, "x-blackboard-token")
             .or_else(|| header(&req.headers, "authorization"));
         if !store.authorized(token_hdr) {
