@@ -1,6 +1,6 @@
 [package]
 name = "rust-blackboard"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2021"
 description = "黑板 blackboard-server v0.6 Rust 版（:8792，协议/API/存储格式与 Python 版一字兼容）"
 
