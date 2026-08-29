@@ -51,9 +51,13 @@ fn handle_sse_conn(store: Arc<Store>, mut stream: TcpStream) -> Result<(), Strin
     // v0.6.5: /events 豁免认证——SSE 是只读事件流（含 i9 订阅，其 central-inbox 无 token），写端才需 token
     let sse_public = path.ends_with("/events") || path == "events";
     {
+        // v0.6.6: 本机回环豁免（同 handle_conn 逻辑）
+        let is_loopback = stream.peer_addr()
+            .map(|addr| addr.ip().is_loopback())
+            .unwrap_or(false);
         let token_hdr = header(&req.headers, "x-blackboard-token")
             .or_else(|| header(&req.headers, "authorization"));
-        if !sse_public && !store.authorized(token_hdr) {
+        if !sse_public && !is_loopback && !store.authorized(token_hdr) {
             respond(&mut stream, 401, &json!({"error": "unauthorized"}));
             return Ok(());
         }
@@ -189,9 +193,14 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
         format!("{}?{}", raw_path, req.query.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&"))
     };
     if !store.is_public_path(&full_path) {
+        // v0.6.6: 本机回环豁免——127.0.0.1 本地请求免 token（本机所有进程/脚本自然通过，
+        // 老登脚本等无需逐个加 token；远端经 Tailscale IP 访问仍需 token，不影响跨端安全）
+        let is_loopback = stream.peer_addr()
+            .map(|addr| addr.ip().is_loopback())
+            .unwrap_or(false);
         let token_hdr = header(&req.headers, "x-blackboard-token")
             .or_else(|| header(&req.headers, "authorization"));
-        if !store.authorized(token_hdr) {
+        if !is_loopback && !store.authorized(token_hdr) {
             return respond(&mut stream, 401, &json!({"error": "unauthorized"}));
         }
     }
