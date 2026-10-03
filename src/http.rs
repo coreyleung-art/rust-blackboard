@@ -81,10 +81,24 @@ fn handle_sse_conn(store: Arc<Store>, mut stream: TcpStream) -> Result<(), Strin
             );
             stream.write_all(hello.as_bytes()).map_err(|e| e.to_string())?;
             stream.flush().ok();
+            // ★ v0.6.9 变更3：Last-Event-ID catch-up——断线期间的漏事件按序重放
+            let last_id: u64 = req
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("last-event-id"))
+                .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if last_id > 0 {
+                for (seq, evt) in crate::sse::replay_after(last_id) {
+                    let frame = format!("event: change\nid: {}\ndata: {}\n\n", seq, evt);
+                    if stream.write_all(frame.as_bytes()).is_err() { return Ok(()); }
+                    stream.flush().ok();
+                }
+            }
             loop {
                 match rx.recv_timeout(Duration::from_secs(crate::sse::PING_SECS)) {
-                    Ok(evt) => {
-                        let frame = format!("event: change\ndata: {}\n\n", evt);
+                    Ok((seq, evt)) => {
+                        let frame = format!("event: change\nid: {}\ndata: {}\n\n", seq, evt);
                         if stream.write_all(frame.as_bytes()).is_err() { break; }
                         stream.flush().ok();
                     }
@@ -200,7 +214,10 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
             .unwrap_or(false);
         let token_hdr = header(&req.headers, "x-blackboard-token")
             .or_else(|| header(&req.headers, "authorization"));
-        if !is_loopback && !store.authorized(token_hdr) {
+        // ★ v0.6.14：只对写方法鉴权（GET 公开——设计承诺「读公开、写鉴权」；
+        //   flip 首轮把读也封了，MBP 同步读 401 属事故，已修）
+        let is_write = matches!(req.method.as_str(), "PUT" | "POST" | "DELETE");
+        if is_write && !is_loopback && !store.authorized(token_hdr) {
             return respond(&mut stream, 401, &json!({"error": "unauthorized"}));
         }
     }
@@ -210,15 +227,47 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
     let resp: (u16, Value) = match req.method.as_str() {
         "GET" => handle_get(store, &path, &req.query),
         "PUT" => {
-            let value: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-            if value.is_null() && !req.body.is_empty() {
-                // body 解析失败 → 空对象（Python 行为）
-                let v = Value::Object(serde_json::Map::new());
-                do_put(store, &path, v, writer.as_deref())
-            } else if value.is_null() {
+            // v0.6.8 修复：静默丢数据（accept-and-discard）
+            //
+            // 旧实现（承袭 Python 版）：body 非空但解析不出 JSON 时，直接落盘空对象 {}
+            // 并返回 200 —— 调用方无法从状态码区分「写成功」与「写丢了」。
+            // 实测复现（2026-09-11）：裸文本 body → 200，回读 value={}；
+            // 且无论 Content-Type 是 text/plain 还是 application/json 都一样
+            // （服务端从不读 Content-Type，触发条件只是「body 不是合法 JSON」）。
+            //
+            // 现改为 fail loud：非 JSON body 明确 400 拒绝，并给出可用写法；
+            // 保留合法用法：空 body = 建键/占位 → {}；JSON 任意类型按原样落盘。
+            // 兼容逃生门：显式声明 X-Body-Text: 1 时按纯文本接收，
+            // 落成 {"content": <text>}（保住内容，不再丢）。
+            let raw_text_optin = header(&req.headers, "x-body-text")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if req.body.is_empty() {
                 do_put(store, &path, Value::Object(serde_json::Map::new()), writer.as_deref())
+            } else if raw_text_optin {
+                let text = String::from_utf8_lossy(&req.body).to_string();
+                do_put(store, &path, json!({ "content": text }), writer.as_deref())
             } else {
-                do_put(store, &path, value, writer.as_deref())
+                match serde_json::from_slice::<Value>(&req.body) {
+                    Ok(Value::Null) => do_put(
+                        store, &path, Value::Object(serde_json::Map::new()), writer.as_deref(),
+                    ),
+                    Ok(v) => do_put(store, &path, v, writer.as_deref()),
+                    Err(e) => {
+                        let prefix: String =
+                            String::from_utf8_lossy(&req.body).chars().take(80).collect();
+                        (
+                            400,
+                            json!({
+                                "error": "invalid body: expected JSON",
+                                "detail": e.to_string(),
+                                "received_prefix": prefix,
+                                "key": path,
+                                "hint": "PUT body 必须是合法 JSON（对象/数组/字符串均可）。纯文本请加请求头 'X-Body-Text: 1'，将落成 {\"content\": \"...\"}。"
+                            }),
+                        )
+                    }
+                }
             }
         }
         "DELETE" => {
@@ -246,8 +295,8 @@ fn handle_conn(store: &Arc<Store>, mut stream: TcpStream) -> Result<(), String> 
                     "registered": ts,
                     "status": "active"
                 });
-                let (ver, _seq) = store.put(&format!("nodes/{}/identity", name), identity.clone(), Some("register"));
-                crate::sse::broadcast(&format!("nodes/{}/identity", name), Some(&identity), ver);
+                let (_ver, _seq) = store.put(&format!("nodes/{}/identity", name), identity.clone(), Some("register"));
+                // ★ v0.6.10：广播由 store.put→notify 单点发出（此处原为冗余二次广播，SSE 客户端每事件收两遍）
                 (200, json!({
                     "device_id": device_id,
                     "token": token,
@@ -280,15 +329,45 @@ fn do_put(store: &Arc<Store>, path: &str, value: Value, writer: Option<&str>) ->
             let (ver, seq) = store.put(&full, value.clone(), writer);
             // 2026-08-28 修复：写入后必须广播 SSE（此前只 store.put 未广播，
             // 导致 SSE 事件桥收不到任何 change 事件 → central-inbox 跨设备注入全断）
-            crate::sse::broadcast(&full, Some(&value), ver);
+            // ★ v0.6.10：冗余二次广播已删（store.put→notify 单点广播）
             let mut r = json!({"key": full, "version": ver, "seq": seq});
             if let Some(w) = writer {
                 r["writer"] = json!(w);
             }
             (200, r)
         }
-        None => (400, json!({"error": "bad key"})),
+        None => (400, bad_key_err(path)),
     }
+}
+
+/// 400「键写法非法」的统一响应体（v0.6.8 新增）
+///
+/// 起因（明鉴首例 2026-09-10，R003 已入册）：调用方拿到 400 的第一反应常是
+/// 「对象不存在 / 卡没写进去」→ **排查方向被误导**（去查"为什么写失败"，而非"键写法对不对"）。
+/// 服务端此前只回 `{"error":"bad key"}`，不说明"是写法错、不是不存在"，于是每个直接 curl
+/// 的智能体都要重走一遍误判（bb-write.py / reflect-collect 已在客户端侧做过提示，
+/// 但服务端侧一直是裸状态码）。现补足：**保留 `error` 字段**（兼容既有判据），
+/// 并给出原因、收到的键、合法示例，以及 400/404 的语义对照。
+fn bad_key_err(path: &str) -> Value {
+    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    let reason = if first.is_empty() {
+        "键为空".to_string()
+    } else if !first.chars().all(|c| c.is_ascii_lowercase()) {
+        format!(
+            "首段命名空间 '{}' 非法：必须是纯小写字母 [a-z]+（不能含连字符 / 数字 / 下划线 / 大写）",
+            first
+        )
+    } else {
+        "键格式非法（如空段 //、含空白字符等）".to_string()
+    };
+    json!({
+        "error": "bad key",
+        "detail": "400 = 键【写法非法】，不是「对象不存在」",
+        "reason": reason,
+        "received": path,
+        "hint": "首段须为纯小写字母命名空间。合法示例: data/cld-health/<key> · notes/<会话或节点>/<key> · tasks/<节点>/<key>。对照：404 = 写法合法但该键不存在",
+        "legal_examples": ["data/cld-health/phi13-example", "notes/mac-mini/example", "tasks/i9/example"],
+    })
 }
 
 fn ns_match(path: &str) -> Option<String> {
@@ -381,8 +460,18 @@ fn handle_get(store: &Arc<Store>, path: &str, query: &[(String, String)]) -> (u1
         _ => {
             if !path.contains('/') || path.ends_with('/') {
                 // 列命名空间
-                let ns = path.trim_end_matches('/').split('/').next().unwrap_or("").to_string();
-                if ns.is_empty() { return (400, json!({"error": "bad key"})); }
+                //
+                // v0.6.8 修复（2026-09-11，跨三方实测取证）：
+                // 旧实现 `path.trim_end_matches('/').split('/').next()` **把路径截断成第一段**，
+                // 于是 `GET /data/reflect/` 与 `GET /data/` 返回**逐字节相同**的整个 data 命名空间
+                // （实测 34.88MB / 20,214 键；而真正属 `data/reflect/` 前缀的只有 11 个）。
+                // 注意：**store.list_ns 本身是按前缀过滤的**（`k.starts_with("{ns}/")`），
+                // 即"前缀列举"从来不是缺失功能，而是被这一行截断吃掉了。
+                // 后果（三方实测并写入 R003）：① 据"按前缀列举"写逻辑必错 ② 「回读含标记即落地」必然假通过
+                // ③ 单次回读 35MB → 小工具 OOM（本机 cage 4GB，今夜已 17 次 OOM）。
+                // 现按**完整前缀**列举：`GET /data/` → data 全部；`GET /data/reflect/` → 仅该前缀。
+                let ns = path.trim_end_matches('/').to_string();
+                if ns.is_empty() { return (400, bad_key_err(path)); }
                 let (items, total) = store.list_ns(&ns, node_filter.as_deref(), limit, offset);
                 (200, json!({"list": items, "total": total, "limit": limit, "offset": offset}))
             } else {
@@ -391,10 +480,15 @@ fn handle_get(store: &Arc<Store>, path: &str, query: &[(String, String)]) -> (u1
                     Some(full) => {
                         match store.get(&full) {
                             Some(e) => (200, json!({"key": full, "version": e.version, "value": e.value, "ts": e.ts})),
-                            None => (404, json!({"error": "not found"})),
+                            None => (404, json!({
+                                "error": "not found",
+                                "key": full,
+                                "detail": "404 = 键写法合法，但该键不存在（≠ 400 写法非法）",
+                                "hint": "先确认键写法是否合法；若刚写入，必须回读校验内容（写入返回 200 不等于内容已落盘）",
+                            })),
                         }
                     }
-                    None => (400, json!({"error": "bad key"})),
+                    None => (400, bad_key_err(path)),
                 }
             }
         }

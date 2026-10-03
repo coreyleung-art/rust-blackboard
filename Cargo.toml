@@ -1,6 +1,6 @@
 [package]
 name = "rust-blackboard"
-version = "0.6.7"
+version = "0.6.17"
 edition = "2021"
 description = "黑板 blackboard-server v0.6 Rust 版（:8792，协议/API/存储格式与 Python 版一字兼容）"
 
@@ -9,6 +9,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 encoding_rs = "0.8"
 chrono = { version = "0.4.45", features = ["clock"] }
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "z"

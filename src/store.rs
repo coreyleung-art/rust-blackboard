@@ -11,6 +11,8 @@ pub struct Config {
     pub port: u16,
     pub data_dir: String,
     pub token: String,
+    // ★ v0.6.12 多端白名单（A0）：BLACKBOARD_TOKENS 逗号分隔；单 token 兼容
+    pub tokens: Vec<String>,
 }
 
 pub fn default_data_dir() -> String {
@@ -56,6 +58,7 @@ pub struct Sub {
 pub struct Store {
     pub data_dir: String,
     pub token: String,
+    pub tokens: Vec<String>,
     pub port: u16,
     state: Mutex<HashMap<String, Entry>>,
     subs: Mutex<HashMap<(String, String), Sub>>,
@@ -93,6 +96,7 @@ impl Store {
         let s = Store {
             data_dir: cfg.data_dir,
             token: cfg.token,
+            tokens: cfg.tokens,
             port: cfg.port,
             state: Mutex::new(HashMap::new()),
             subs: Mutex::new(HashMap::new()),
@@ -247,8 +251,10 @@ impl Store {
         }
         let _guard = self.io_lock.lock().unwrap();
         let ap = PathBuf::from(&self.data_dir).join("audit.jsonl");
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&ap) {
-            let _ = writeln!(f, "{}", entry);
+        match fs::OpenOptions::new().create(true).append(true).open(&ap) {
+            Ok(mut f) => { let _ = writeln!(f, "{}", entry); }
+            // ★ v0.6.11：持久化静默失败告警（2026-10-03 事故根因——27 天内存态无人知）
+            Err(e) => eprintln!("[blackboard] ⚠️ audit 持久化失败（数据将只存内存！）{}: {}", ap.display(), e),
         }
     }
 
@@ -341,6 +347,8 @@ impl Store {
         if let Ok(txt) = serde_json::to_string(&d) {
             if fs::write(&tmp, txt).is_ok() {
                 let _ = fs::rename(&tmp, &p);
+            } else {
+                eprintln!("[blackboard] ⚠️ subs 持久化失败: {}", tmp.display());
             }
         }
     }
@@ -485,30 +493,36 @@ impl Store {
     // 认证
     /// P1-3c 认证中间件：token 空=不校验；支持 X-Blackboard-Token 或 Bearer
     pub fn authorized(&self, header_token: Option<&str>) -> bool {
-        if self.token.is_empty() { return true; }
-        match header_token {
-            Some(t) => {
-                // 支持 X-Blackboard-Token: <token> 或 Authorization: Bearer <token>
-                let clean = t.strip_prefix("Bearer ").unwrap_or(t).trim();
-                clean == self.token.as_str()
+        // ★ v0.6.12：多端白名单——tokens 非空时按集合判定；空=鉴权关
+        if self.tokens.is_empty() { return true; }
+        let clean = match header_token {
+            Some(t) => t.strip_prefix("Bearer ").unwrap_or(t).trim(),
+            None => return false,
+        };
+        for entry in &self.tokens {
+            if entry == clean { return true; }
+            // ★ v0.6.16 指纹比对（修正）：白名单条目可为 sha256 指纹**前缀**（8-64 位 hex）——
+            //   哈希互证约定用前 16 位，v0.6.13 误要求恰好 64 位 ⇒ 对端全部 401（实测事故）。
+            //   v0.6.16：条目为全 hex 且长度 8-64 时按前缀比对；原文 token 的精确相等已在前面判过。
+            if entry.len() >= 8 && entry.len() <= 64 && entry.chars().all(|c| c.is_ascii_hexdigit()) {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(clean.as_bytes());
+                if format!("{:x}", h.finalize()).starts_with(entry.as_str()) { return true; }
             }
-            None => false,
         }
+        false
     }
     /// 公开端点白名单（健康检查/对时免认证）
     /// v0.6.5: 加 i9 节点豁免——i9 node-bridge 暂缓升级（无 token 能力），
     /// 其请求路径（nodes/i9/* / tasks?node=i9 / notes/i9/*）放行，避免启用 token 后 i9 断链
     /// v0.6.7: 扩展豁免——i9 的 register + tasks/i9/* + notes/i9/* 全路径（此前漏 register/queue 写）
+    /// ★ v0.6.17（2026-10-03 预备，10-04 窗口部署）：移除 i9 路径豁免——
+    ///   i9 已发令牌 bb-token-20261003-i9（指纹入白名单），写端一律走 token 鉴权。
+    ///   回环豁免（127.0.0.1）与 GET 公开不变；删除全部 i9 行。
     pub fn is_public_path(&self, path: &str) -> bool {
         matches!(path, "clock" | "help" | "ns-registry")
             || path == "register"
-            || path.contains("nodes/i9/")
-            || path.contains("notes/i9/")
-            || path.contains("tasks?node=i9")
-            || path.contains("tasks/node=i9")
-            || path == "tasks?node=i9"
-            || path.contains("tasks/i9/")
-            || path.starts_with("nodes/i9")
     }
 }
 
@@ -618,7 +632,7 @@ mod tests {
     fn test_store() -> Store {
         let dir = format!("/tmp/bb-test-{}", std::process::id());
         let _ = fs::remove_dir_all(&dir);
-        Store::new(Config { port: 0, data_dir: dir, token: String::new() })
+        Store::new(Config { port: 0, data_dir: dir, token: String::new(), tokens: vec![] })
     }
 
     #[test]
@@ -631,6 +645,19 @@ mod tests {
         assert!(b - a <= 2, "同秒递增应为 +1: {} -> {}", a, b);
         // 格式检查：物理秒*10^6 + 计数
         assert!(a >= 1_700_000_000_000_000, "seq 应含物理秒前缀: {}", a);
+    }
+
+    // ★ v0.6.17：i9 豁免移除后公开路径断言（负控：notes/i9 不再公开；正控：clock/register 仍公开）
+    #[test]
+    fn public_path_i9_exemption_removed() {
+        let s = test_store();
+        assert!(s.is_public_path("clock"));
+        assert!(s.is_public_path("register"));
+        assert!(!s.is_public_path("notes/i9/token-onboarding"), "notes/i9 写不应再免鉴权");
+        assert!(!s.is_public_path("nodes/i9/x"), "nodes/i9 不应再免鉴权");
+        assert!(!s.is_public_path("tasks?node=i9"), "tasks?node=i9 不应再免鉴权");
+        assert!(!s.is_public_path("tasks/i9/x"), "tasks/i9 不应再免鉴权");
+        assert!(!s.is_public_path("notes/mbp/x"), "其他节点路径本就不公开（对照组）");
     }
 
     #[test]
@@ -745,7 +772,7 @@ mod tests {
     fn authorized_token_check() {
         let dir = format!("/tmp/bb-tok-{}", std::process::id());
         let _ = fs::remove_dir_all(&dir);
-        let s = Store::new(Config { port: 0, data_dir: dir, token: "secret".into() });
+        let s = Store::new(Config { port: 0, data_dir: dir, token: "secret".into(), tokens: vec!["secret".into()] });
         assert!(!s.authorized(Some("wrong")));
         assert!(s.authorized(Some("secret")));
         assert!(!s.authorized(None));
